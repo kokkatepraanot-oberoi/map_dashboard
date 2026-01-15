@@ -43,16 +43,12 @@ st.sidebar.markdown(
 @st.cache_data(show_spinner=False)
 def load_all(fall_upload, spring_upload) -> pd.DataFrame:
     frames = []
-
     if fall_upload is not None:
         frames.append(load_map_excel(fall_upload.getvalue(), term_label="Sep 2025"))
-
     if spring_upload is not None:
         frames.append(load_map_excel(spring_upload.getvalue(), term_label="Mar 2026"))
-
     if not frames:
         return pd.DataFrame()
-
     return pd.concat(frames, ignore_index=True)
 
 
@@ -103,6 +99,69 @@ def metric_row(df: pd.DataFrame):
     c3.metric("% Intervention Priority", f"{pct_priority:.1f}%")
 
 
+# ----------------- NEW: Table styling (color-coded) -----------------
+def _row_bg_color(row: pd.Series):
+    """Return a list of CSS styles for the whole row based on percentile_status."""
+    status = row.get("percentile_status", "")
+    if status == "High Risk (Achievement)":
+        bg = "rgba(192,57,43,0.12)"   # MAP red tint
+    elif status == "At Risk (Achievement)":
+        bg = "rgba(242,201,76,0.20)"  # MAP yellow tint
+    elif status == "On Track (Achievement)":
+        bg = "rgba(47,111,178,0.12)"  # MAP blue tint
+    else:
+        bg = "transparent"
+    return [f"background-color: {bg}"] * len(row)
+
+
+def style_map_table(df: pd.DataFrame, highlight_status_col: bool = True):
+    """
+    Return a pandas Styler with MAP-style row colour coding.
+    Note: works with st.dataframe(styler)
+    """
+    styler = (
+        df.style
+        .apply(_row_bg_color, axis=1)
+        .format(
+            {
+                "rit": "{:.0f}",
+                "percentile": "{:.0f}",
+            },
+            na_rep=""
+        )
+    )
+
+    if highlight_status_col and "percentile_status" in df.columns:
+        # slightly stronger emphasis on the status cell itself
+        def _status_cell(val):
+            if val == "High Risk (Achievement)":
+                return "font-weight: 700; color: #C0392B;"
+            if val == "At Risk (Achievement)":
+                return "font-weight: 700; color: #8a6a00;"
+            if val == "On Track (Achievement)":
+                return "font-weight: 700; color: #2F6FB2;"
+            return ""
+        styler = styler.map(_status_cell, subset=["percentile_status"])
+
+    # Cleaner header
+    styler = styler.set_table_styles(
+        [
+            {"selector": "th", "props": [("background-color", "white"), ("color", "#111827")]},
+            {"selector": "td", "props": [("border-color", "rgba(0,0,0,0.06)")]},
+        ]
+    )
+
+    return styler
+
+
+def show_styled_table(df: pd.DataFrame, use_container_width: bool = True):
+    """Helper to render styled tables safely."""
+    if df.empty:
+        st.info("No records match the current filters.")
+        return
+    st.dataframe(style_map_table(df), use_container_width=use_container_width)
+
+
 # ---------------- Teacher View ----------------
 if view_mode == "Teacher View":
     st.subheader("Teacher View")
@@ -129,10 +188,10 @@ if view_mode == "Teacher View":
 
     metric_row(df)
     map_badge_row(pctl_risk, pctl_high)
-
     st.divider()
 
     st.markdown("### Intervention Priority Students")
+
     # Sort so High Risk appears first, then At Risk
     priority_sort_key = {"High Risk": 0, "At Risk": 1, "On Track": 2}
     df["_priority_sort"] = df["priority_level"].map(priority_sort_key).fillna(9)
@@ -146,8 +205,8 @@ if view_mode == "Teacher View":
         "student_id", "student_name", "grade", "section", "subject",
         "rit", "percentile", "percentile_status", "priority_reason"
     ]
-    # If teacher column is useful on teacher view (optional), leave it out
-    st.dataframe(priority_df[show_cols], use_container_width=True)
+
+    show_styled_table(priority_df[show_cols])
 
     st.download_button(
         "Download intervention list (CSV)",
@@ -158,11 +217,9 @@ if view_mode == "Teacher View":
 
     st.divider()
     st.markdown("### All Students (filtered)")
-    st.dataframe(df[show_cols], use_container_width=True)
+    show_styled_table(df[show_cols])
 
-    # Clean helper column
-    if "_priority_sort" in df.columns:
-        df.drop(columns=["_priority_sort"], inplace=True, errors="ignore")
+    df.drop(columns=["_priority_sort"], inplace=True, errors="ignore")
 
 
 # ---------------- Admin View ----------------
@@ -187,10 +244,10 @@ else:
 
     metric_row(df)
     map_badge_row(pctl_risk, pctl_high)
-
     st.divider()
 
     st.markdown("### Intervention Priority (Schoolwide)")
+
     priority_sort_key = {"High Risk": 0, "At Risk": 1, "On Track": 2}
     df["_priority_sort"] = df["priority_level"].map(priority_sort_key).fillna(9)
 
@@ -203,7 +260,8 @@ else:
         "teacher", "student_id", "student_name", "grade", "section", "subject",
         "rit", "percentile", "percentile_status", "priority_reason", "term"
     ]
-    st.dataframe(priority_df[show_cols_admin], use_container_width=True)
+
+    show_styled_table(priority_df[show_cols_admin])
 
     st.download_button(
         "Download intervention list (CSV)",
@@ -229,10 +287,9 @@ else:
         (summary["intervention_priority"] / summary["records"] * 100).round(1)
     )
 
-    # Make it nicer to read
     summary = summary.sort_values(["grade", "subject"])
+
+    # Summary also gets colour coding, but it doesn't have percentile_status.
     st.dataframe(summary, use_container_width=True)
 
-    # Clean helper column
-    if "_priority_sort" in df.columns:
-        df.drop(columns=["_priority_sort"], inplace=True, errors="ignore")
+    df.drop(columns=["_priority_sort"], inplace=True, errors="ignore")
