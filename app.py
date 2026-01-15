@@ -1,39 +1,60 @@
+# app.py
 import streamlit as st
 import pandas as pd
 
-from ui_theme import inject_map_css, percentile_band
-inject_map_css()
-
 from data_loader import load_map_excel
 from flags import apply_flags
+from ui_theme import inject_map_css, percentile_band
 
-
+# ---------------- Page config + MAP styling ----------------
 st.set_page_config(page_title="MAP Dashboard", layout="wide")
+inject_map_css()
 
-st.title("MAP Dashboard (Sep 2025 → Mar 2026 Growth)")
+st.title("MAP Dashboard")
+st.caption(
+    "MAP notes: Percentile indicates relative achievement vs norms; growth is evaluated using RIT change "
+    "(Observed Growth) once Spring data is available."
+)
 
-# -------- Sidebar controls --------
-st.sidebar.header("Data")
+# ---------------- Sidebar controls ----------------
+st.sidebar.header("Data Uploads")
 fall_file = st.sidebar.file_uploader("Upload Fall (Sep 2025) MAP Excel", type=["xlsx"])
 spring_file = st.sidebar.file_uploader("Upload Spring (Mar 2026) MAP Excel (optional)", type=["xlsx"])
 
 st.sidebar.header("View")
 view_mode = st.sidebar.radio("Select View", ["Teacher View", "Admin View"], index=0)
 
-st.sidebar.header("Flag Rules")
-pctl_risk = st.sidebar.slider("Risk threshold (percentile)", 5, 50, 25, 1)
-pctl_high = st.sidebar.slider("High-risk threshold (percentile)", 1, 25, 10, 1)
+st.sidebar.header("Intervention Priority Rules (Achievement)")
+pctl_risk = st.sidebar.slider("At Risk threshold (percentile)", 5, 50, 25, 1)
+pctl_high = st.sidebar.slider("High Risk threshold (percentile)", 1, 25, 10, 1)
 
+# MAP-style legend pills
+st.sidebar.markdown("---")
+st.sidebar.markdown(
+    f"""
+    <span class="map-pill map-blue">On Track</span><br>
+    <span class="map-pill map-yellow">At Risk (below {pctl_risk}th)</span><br>
+    <span class="map-pill map-red">High Risk (below {pctl_high}th)</span>
+    """,
+    unsafe_allow_html=True,
+)
+
+# ---------------- Data loading ----------------
 @st.cache_data(show_spinner=False)
-def load_all(fall_bytes, spring_bytes):
+def load_all(fall_upload, spring_upload) -> pd.DataFrame:
     frames = []
-    if fall_bytes:
-        frames.append(load_map_excel(fall_bytes, term_label="Sep 2025"))
-    if spring_bytes:
-        frames.append(load_map_excel(spring_bytes, term_label="Mar 2026"))
+
+    if fall_upload is not None:
+        frames.append(load_map_excel(fall_upload.getvalue(), term_label="Sep 2025"))
+
+    if spring_upload is not None:
+        frames.append(load_map_excel(spring_upload.getvalue(), term_label="Mar 2026"))
+
     if not frames:
         return pd.DataFrame()
+
     return pd.concat(frames, ignore_index=True)
+
 
 data = load_all(fall_file, spring_file)
 
@@ -41,19 +62,56 @@ if data.empty:
     st.info("Upload at least the Fall (Sep 2025) MAP file to begin.")
     st.stop()
 
+# Apply MAP-aligned intervention priority
 data = apply_flags(data, pctl_risk=pctl_risk, pctl_high=pctl_high)
 
-# Common filters
+# Add percentile status (MAP-style interpretation)
+data["percentile_status"] = data["percentile"].apply(
+    lambda x: percentile_band(x, pctl_risk=pctl_risk, pctl_high=pctl_high)[0]
+)
+
+# ---------------- Common filter options ----------------
 subjects = ["All"] + sorted(data["subject"].dropna().unique().tolist())
 terms = ["All"] + sorted(data["term"].dropna().unique().tolist())
-grades = ["All"] + sorted([int(x) for x in data["grade"].dropna().unique().tolist()])
 
-# -------- Teacher view --------
+grade_vals = sorted([int(x) for x in data["grade"].dropna().unique().tolist()]) if "grade" in data.columns else []
+grades = ["All"] + grade_vals
+
+teacher_vals = sorted(data["teacher"].dropna().unique().tolist()) if "teacher" in data.columns else []
+teachers = ["All"] + teacher_vals
+
+
+def map_badge_row(pctl_risk_val: int, pctl_high_val: int):
+    st.markdown(
+        f"""
+        <span class="map-pill map-blue">On Track</span>
+        <span class="map-pill map-yellow">At Risk (below {pctl_risk_val}th percentile)</span>
+        <span class="map-pill map-red">High Risk (below {pctl_high_val}th percentile)</span>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def metric_row(df: pd.DataFrame):
+    total_rows = len(df)
+    priority_rows = int(df["intervention_priority"].sum()) if "intervention_priority" in df.columns else 0
+    pct_priority = (priority_rows / total_rows * 100) if total_rows else 0
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Records (rows)", f"{total_rows}")
+    c2.metric("Intervention Priority (rows)", f"{priority_rows}")
+    c3.metric("% Intervention Priority", f"{pct_priority:.1f}%")
+
+
+# ---------------- Teacher View ----------------
 if view_mode == "Teacher View":
     st.subheader("Teacher View")
 
-    teacher_list = sorted(data["teacher"].dropna().unique().tolist())
-    teacher = st.selectbox("Select Teacher", teacher_list)
+    if not teacher_vals:
+        st.warning("No teacher column detected in the data.")
+        st.stop()
+
+    teacher = st.selectbox("Select Teacher", teacher_vals)
 
     c1, c2, c3 = st.columns(3)
     term_sel = c1.selectbox("Term", terms, index=0)
@@ -61,6 +119,7 @@ if view_mode == "Teacher View":
     subject_sel = c3.selectbox("Subject", subjects, index=0)
 
     df = data[data["teacher"] == teacher].copy()
+
     if term_sel != "All":
         df = df[df["term"] == term_sel]
     if grade_sel != "All":
@@ -68,23 +127,32 @@ if view_mode == "Teacher View":
     if subject_sel != "All":
         df = df[df["subject"] == subject_sel]
 
-    # KPIs
-    total = len(df)
-    flagged = int(df["flagged"].sum())
-    st.metric("Students (rows)", total)
-    st.metric("Flagged (rows)", flagged)
+    metric_row(df)
+    map_badge_row(pctl_risk, pctl_high)
 
     st.divider()
-    st.markdown("### Flagged Students")
-    flagged_df = df[df["flagged"]].sort_values(["subject", "percentile", "rit"], ascending=[True, True, True])
 
-    show_cols = ["student_id", "student_name", "grade", "section", "subject", "rit", "percentile", "flag_reason"]
-    st.dataframe(flagged_df[show_cols], use_container_width=True)
+    st.markdown("### Intervention Priority Students")
+    # Sort so High Risk appears first, then At Risk
+    priority_sort_key = {"High Risk": 0, "At Risk": 1, "On Track": 2}
+    df["_priority_sort"] = df["priority_level"].map(priority_sort_key).fillna(9)
+
+    priority_df = df[df["intervention_priority"]].sort_values(
+        ["_priority_sort", "subject", "percentile", "rit"],
+        ascending=[True, True, True, True]
+    )
+
+    show_cols = [
+        "student_id", "student_name", "grade", "section", "subject",
+        "rit", "percentile", "percentile_status", "priority_reason"
+    ]
+    # If teacher column is useful on teacher view (optional), leave it out
+    st.dataframe(priority_df[show_cols], use_container_width=True)
 
     st.download_button(
-        "Download flagged list (CSV)",
-        data=flagged_df[show_cols].to_csv(index=False).encode("utf-8"),
-        file_name=f"flagged_{teacher.replace(' ', '_')}.csv",
+        "Download intervention list (CSV)",
+        data=priority_df[show_cols].to_csv(index=False).encode("utf-8"),
+        file_name=f"intervention_priority_{teacher.replace(' ', '_')}.csv",
         mime="text/csv",
     )
 
@@ -92,7 +160,12 @@ if view_mode == "Teacher View":
     st.markdown("### All Students (filtered)")
     st.dataframe(df[show_cols], use_container_width=True)
 
-# -------- Admin view --------
+    # Clean helper column
+    if "_priority_sort" in df.columns:
+        df.drop(columns=["_priority_sort"], inplace=True, errors="ignore")
+
+
+# ---------------- Admin View ----------------
 else:
     st.subheader("Admin View")
 
@@ -100,7 +173,7 @@ else:
     term_sel = c1.selectbox("Term", terms, index=0)
     grade_sel = c2.selectbox("Grade", grades, index=0)
     subject_sel = c3.selectbox("Subject", subjects, index=0)
-    teacher_sel = c4.selectbox("Teacher", ["All"] + sorted(data["teacher"].dropna().unique().tolist()), index=0)
+    teacher_sel = c4.selectbox("Teacher", teachers, index=0)
 
     df = data.copy()
     if term_sel != "All":
@@ -112,41 +185,54 @@ else:
     if teacher_sel != "All":
         df = df[df["teacher"] == teacher_sel]
 
-    # KPIs
-    total = len(df)
-    flagged = int(df["flagged"].sum())
-    pct_flagged = (flagged / total * 100) if total else 0
-
-    k1, k2, k3 = st.columns(3)
-    k1.metric("Rows", total)
-    k2.metric("Flagged rows", flagged)
-    k3.metric("% flagged", f"{pct_flagged:.1f}%")
+    metric_row(df)
+    map_badge_row(pctl_risk, pctl_high)
 
     st.divider()
-    st.markdown("### Flagged Students (Schoolwide)")
-    flagged_df = df[df["flagged"]].sort_values(["grade", "subject", "percentile"], ascending=[True, True, True])
 
-    show_cols = ["teacher", "student_id", "student_name", "grade", "section", "subject", "rit", "percentile", "flag_reason", "term"]
-    st.dataframe(flagged_df[show_cols], use_container_width=True)
+    st.markdown("### Intervention Priority (Schoolwide)")
+    priority_sort_key = {"High Risk": 0, "At Risk": 1, "On Track": 2}
+    df["_priority_sort"] = df["priority_level"].map(priority_sort_key).fillna(9)
+
+    priority_df = df[df["intervention_priority"]].sort_values(
+        ["_priority_sort", "grade", "subject", "percentile", "rit"],
+        ascending=[True, True, True, True, True],
+    )
+
+    show_cols_admin = [
+        "teacher", "student_id", "student_name", "grade", "section", "subject",
+        "rit", "percentile", "percentile_status", "priority_reason", "term"
+    ]
+    st.dataframe(priority_df[show_cols_admin], use_container_width=True)
 
     st.download_button(
-        "Download flagged list (CSV)",
-        data=flagged_df[show_cols].to_csv(index=False).encode("utf-8"),
-        file_name="flagged_schoolwide.csv",
+        "Download intervention list (CSV)",
+        data=priority_df[show_cols_admin].to_csv(index=False).encode("utf-8"),
+        file_name="intervention_priority_schoolwide.csv",
         mime="text/csv",
     )
 
     st.divider()
-    st.markdown("### Summary by Grade + Subject")
+    st.markdown("### Summary by Grade × Subject")
+
     summary = (
         df.groupby(["grade", "subject"], dropna=False)
           .agg(
-              rows=("student_id", "count"),
-              flagged=("flagged", "sum"),
+              records=("student_id", "count"),
+              intervention_priority=("intervention_priority", "sum"),
               avg_rit=("rit", "mean"),
               avg_percentile=("percentile", "mean"),
           )
           .reset_index()
     )
-    summary["pct_flagged"] = (summary["flagged"] / summary["rows"] * 100).round(1)
+    summary["pct_intervention_priority"] = (
+        (summary["intervention_priority"] / summary["records"] * 100).round(1)
+    )
+
+    # Make it nicer to read
+    summary = summary.sort_values(["grade", "subject"])
     st.dataframe(summary, use_container_width=True)
+
+    # Clean helper column
+    if "_priority_sort" in df.columns:
+        df.drop(columns=["_priority_sort"], inplace=True, errors="ignore")
