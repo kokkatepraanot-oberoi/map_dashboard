@@ -1,8 +1,12 @@
 import streamlit as st
 import pandas as pd
 
+from ui_theme import inject_map_css, percentile_band
+inject_map_css()
+
 from data_loader import load_map_excel
 from flags import apply_flags
+
 
 st.set_page_config(page_title="MAP Dashboard", layout="wide")
 
