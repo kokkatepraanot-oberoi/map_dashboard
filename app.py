@@ -37,11 +37,12 @@ st.sidebar.markdown("---")
 st.sidebar.markdown(
     f"""
     <span class="map-pill map-blue">On Track</span><br>
-    <span class="map-pill map-yellow">At Risk (below {pctl_riskfer =pctl_risk}th)</span><br>
+    <span class="map-pill map-yellow">At Risk (below {pctl_risk}th)</span><br>
     <span class="map-pill map-red">High Risk (below {pctl_high}th)</span>
     """,
     unsafe_allow_html=True,
 )
+
 
 # ---------------- Data loading ----------------
 @st.cache_data(show_spinner=False)
