@@ -1,6 +1,5 @@
 # gdrive_store.py
 import io
-import json
 from typing import Dict, List, Optional
 
 import streamlit as st
@@ -12,11 +11,30 @@ SCOPES = ["https://www.googleapis.com/auth/drive"]
 
 
 def _drive_client():
-    sa_json = st.secrets.get("GDRIVE_SERVICE_ACCOUNT_JSON")
-    if not sa_json:
-        raise RuntimeError("Missing secret: GDRIVE_SERVICE_ACCOUNT_JSON")
+    """
+    Auth using TOML fields in Streamlit secrets under [gdrive_service_account].
+    This avoids JSON parsing issues from multiline private keys.
+    """
+    sa = st.secrets.get("gdrive_service_account")
+    if not sa:
+        raise RuntimeError("Missing secrets table: [gdrive_service_account]")
 
-    info = json.loads(sa_json)
+    info = {
+        "type": sa.get("type", "service_account"),
+        "project_id": sa["project_id"],
+        "private_key_id": sa["private_key_id"],
+        # Google auth expects the key to contain real newlines; TOML triple quotes preserves them.
+        "private_key": sa["private_key"],
+        "client_email": sa["client_email"],
+        "client_id": sa["client_id"],
+        "auth_uri": sa.get("auth_uri", "https://accounts.google.com/o/oauth2/auth"),
+        "token_uri": sa.get("token_uri", "https://oauth2.googleapis.com/token"),
+        "auth_provider_x509_cert_url": sa.get(
+            "auth_provider_x509_cert_url", "https://www.googleapis.com/oauth2/v1/certs"
+        ),
+        "client_x509_cert_url": sa["client_x509_cert_url"],
+    }
+
     creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
