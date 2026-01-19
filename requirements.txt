@@ -1,4 +1,8 @@
-streamlit==1.53.0
-pandas==2.3.3
-openpyxl==3.1.5
+streamlit
+pandas
+openpyxl
 numpy
+google-api-python-client
+google-auth
+google-auth-httplib2
+pyarrow
