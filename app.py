@@ -1,92 +1,60 @@
 # app.py
-import streamlit as st
+import re
+from io import BytesIO
+from typing import Optional, Tuple
+
+import numpy as np
 import pandas as pd
+import streamlit as st
 
-from data_loader import load_map_excel
-from flags import apply_flags
-from ui_theme import inject_map_css, percentile_band
+from gdrive_store import list_files_in_folder, download_file_bytes, upload_bytes_to_folder
 
-# ---------------- Page config + MAP styling ----------------
+
+# ---------------- Page config ----------------
 st.set_page_config(page_title="MAP Dashboard", layout="wide")
+
+
+# ---------------- MAP-ish CSS ----------------
+MAP_BLUE = "#2F6FB2"
+MAP_YELLOW = "#F2C94C"
+MAP_RED = "#C0392B"
+MAP_BG = "#F9FAFB"
+
+
+def inject_map_css():
+    st.markdown(
+        f"""
+        <style>
+          .stApp {{ background: {MAP_BG}; }}
+          h1,h2,h3 {{ letter-spacing: -0.2px; }}
+
+          .map-pill {{
+            display:inline-block; padding:0.18rem 0.55rem; border-radius:999px;
+            font-size:0.85rem; font-weight:600; margin-right:0.35rem;
+            border:1px solid rgba(0,0,0,0.08);
+          }}
+          .map-blue {{ background: rgba(47,111,178,0.12); color: {MAP_BLUE}; }}
+          .map-yellow {{ background: rgba(242,201,76,0.18); color: #8a6a00; }}
+          .map-red {{ background: rgba(192,57,43,0.12); color: {MAP_RED}; }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 inject_map_css()
 
-st.title("MAP Dashboard")
-st.caption(
-    "MAP notes: Percentile indicates relative achievement vs norms; growth is evaluated using RIT change "
-    "(Observed Growth) once Spring data is available."
-)
 
-# ---------------- Sidebar controls ----------------
-st.sidebar.header("Data Uploads")
-fall_file = st.sidebar.file_uploader("Upload Fall (Sep 2025) MAP Excel", type=["xlsx"])
-spring_file = st.sidebar.file_uploader("Upload Spring (Mar 2026) MAP Excel (optional)", type=["xlsx"])
-
-st.sidebar.header("View")
-view_mode = st.sidebar.radio(
-    "Select View",
-    ["Teacher View", "Admin View", "Student Profile (Leader)"],
-    index=0,
-)
-
-st.sidebar.header("Intervention Priority Rules (Achievement)")
-pctl_risk = st.sidebar.slider("At Risk threshold (percentile)", 5, 50, 25, 1)
-pctl_high = st.sidebar.slider("High Risk threshold (percentile)", 1, 25, 10, 1)
-
-# MAP-style legend pills
-st.sidebar.markdown("---")
-st.sidebar.markdown(
-    f"""
-    <span class="map-pill map-blue">On Track</span><br>
-    <span class="map-pill map-yellow">At Risk (below {pctl_risk}th)</span><br>
-    <span class="map-pill map-red">High Risk (below {pctl_high}th)</span>
-    """,
-    unsafe_allow_html=True,
-)
-
-
-# ---------------- Data loading ----------------
-@st.cache_data(show_spinner=False)
-def load_all(fall_upload, spring_upload) -> pd.DataFrame:
-    frames = []
-    if fall_upload is not None:
-        frames.append(load_map_excel(fall_upload.getvalue(), term_label="Sep 2025"))
-    if spring_upload is not None:
-        frames.append(load_map_excel(spring_upload.getvalue(), term_label="Mar 2026"))
-    if not frames:
-        return pd.DataFrame()
-    return pd.concat(frames, ignore_index=True)
-
-
-data = load_all(fall_file, spring_file)
-
-if data.empty:
-    st.info("Upload at least the Fall (Sep 2025) MAP file to begin.")
-    st.stop()
-
-# Apply MAP-aligned intervention priority
-data = apply_flags(data, pctl_risk=pctl_risk, pctl_high=pctl_high)
-
-# Add percentile status (MAP-style interpretation)
-data["percentile_status"] = data["percentile"].apply(
-    lambda x: percentile_band(x, pctl_risk=pctl_risk, pctl_high=pctl_high)[0]
-)
-
-# ---------------- Common filter options ----------------
-subjects = ["All"] + sorted(data["subject"].dropna().unique().tolist())
-terms = ["All"] + sorted(data["term"].dropna().unique().tolist())
-
-grade_vals = sorted([int(x) for x in data["grade"].dropna().unique().tolist()]) if "grade" in data.columns else []
-grades = ["All"] + grade_vals
-
-teacher_vals = sorted(data["teacher"].dropna().unique().tolist()) if "teacher" in data.columns else []
-teachers = ["All"] + teacher_vals
-
-# Student list labels for the profile view
-student_vals = []
-if "student_id" in data.columns and "student_name" in data.columns:
-    tmp = data[["student_id", "student_name"]].dropna().drop_duplicates()
-    tmp["label"] = tmp["student_id"].astype(str).str.strip() + " — " + tmp["student_name"].astype(str).str.strip()
-    student_vals = tmp.sort_values("label")["label"].tolist()
+# ---------------- Helpers: status, ranges ----------------
+def percentile_band(pctl_mid: float | None, pctl_risk=25, pctl_high=10) -> Tuple[str, str]:
+    if pctl_mid is None or (isinstance(pctl_mid, float) and np.isnan(pctl_mid)):
+        return ("No Data", "map-yellow")
+    p = float(pctl_mid)
+    if p < pctl_high:
+        return ("High Risk (Achievement)", "map-red")
+    if p < pctl_risk:
+        return ("At Risk (Achievement)", "map-yellow")
+    return ("On Track (Achievement)", "map-blue")
 
 
 def map_badge_row(pctl_risk_val: int, pctl_high_val: int):
@@ -100,82 +68,421 @@ def map_badge_row(pctl_risk_val: int, pctl_high_val: int):
     )
 
 
-def metric_row(df: pd.DataFrame):
-    total_rows = len(df)
-    priority_rows = int(df["intervention_priority"].sum()) if "intervention_priority" in df.columns else 0
-    pct_priority = (priority_rows / total_rows * 100) if total_rows else 0
+def _format_range(low: Optional[float], high: Optional[float], mid: Optional[float]) -> str:
+    low_ok = low is not None and not (isinstance(low, float) and np.isnan(low))
+    high_ok = high is not None and not (isinstance(high, float) and np.isnan(high))
+    mid_ok = mid is not None and not (isinstance(mid, float) and np.isnan(mid))
+    if low_ok and high_ok:
+        return f"{int(low)}–{int(high)}"
+    if mid_ok:
+        return f"{int(mid)}"
+    if low_ok:
+        return f"{int(low)}"
+    if high_ok:
+        return f"{int(high)}"
+    return ""
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Records (rows)", f"{total_rows}")
-    c2.metric("Intervention Priority (rows)", f"{priority_rows}")
-    c3.metric("% Intervention Priority", f"{pct_priority:.1f}%")
+
+def add_display_ranges(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out["rit_range"] = out.apply(lambda r: _format_range(r.get("rit_low"), r.get("rit_high"), r.get("rit")), axis=1)
+    out["percentile_range"] = out.apply(
+        lambda r: _format_range(r.get("percentile_low"), r.get("percentile_high"), r.get("percentile")),
+        axis=1
+    )
+    return out
 
 
-# ----------------- Table styling (color-coded) -----------------
+def apply_flags(df: pd.DataFrame, pctl_risk=25, pctl_high=10) -> pd.DataFrame:
+    out = df.copy()
+    out["high_risk_achievement"] = out["percentile"].notna() & (out["percentile"] < pctl_high)
+    out["at_risk_achievement"] = out["percentile"].notna() & (out["percentile"] < pctl_risk)
+    out["intervention_priority"] = out["high_risk_achievement"] | out["at_risk_achievement"]
+    out["priority_level"] = np.select(
+        [out["high_risk_achievement"], out["at_risk_achievement"]],
+        ["High Risk", "At Risk"],
+        default="On Track"
+    )
+    out["priority_reason"] = np.select(
+        [out["high_risk_achievement"], out["at_risk_achievement"]],
+        [f"Achievement percentile < {pctl_high}", f"Achievement percentile < {pctl_risk}"],
+        default=""
+    )
+    return out
+
+
+# ---------------- Styling: color-coded rows ----------------
 def _row_bg_color(row: pd.Series):
     status = row.get("percentile_status", "")
     if status == "High Risk (Achievement)":
-        bg = "rgba(192,57,43,0.12)"   # red tint
+        bg = "rgba(192,57,43,0.12)"
     elif status == "At Risk (Achievement)":
-        bg = "rgba(242,201,76,0.20)"  # yellow tint
+        bg = "rgba(242,201,76,0.20)"
     elif status == "On Track (Achievement)":
-        bg = "rgba(47,111,178,0.12)"  # blue tint
+        bg = "rgba(47,111,178,0.12)"
     else:
         bg = "transparent"
     return [f"background-color: {bg}"] * len(row)
 
 
-def style_map_table(df: pd.DataFrame, highlight_status_col: bool = True):
-    styler = (
-        df.style
-        .apply(_row_bg_color, axis=1)
-        .format({"rit": "{:.0f}", "percentile": "{:.0f}"}, na_rep="")
-    )
-
-    if highlight_status_col and "percentile_status" in df.columns:
+def style_map_table(df: pd.DataFrame):
+    styler = df.style.apply(_row_bg_color, axis=1)
+    if "percentile_status" in df.columns:
         def _status_cell(val):
             if val == "High Risk (Achievement)":
-                return "font-weight: 700; color: #C0392B;"
+                return "font-weight:700; color:#C0392B;"
             if val == "At Risk (Achievement)":
-                return "font-weight: 700; color: #8a6a00;"
+                return "font-weight:700; color:#8a6a00;"
             if val == "On Track (Achievement)":
-                return "font-weight: 700; color: #2F6FB2;"
+                return "font-weight:700; color:#2F6FB2;"
             return ""
         styler = styler.map(_status_cell, subset=["percentile_status"])
-
-    styler = styler.set_table_styles(
-        [
-            {"selector": "th", "props": [("background-color", "white"), ("color", "#111827")]},
-            {"selector": "td", "props": [("border-color", "rgba(0,0,0,0.06)")]},
-        ]
-    )
     return styler
 
 
-def show_styled_table(df: pd.DataFrame, use_container_width: bool = True):
+def show_styled_table(df: pd.DataFrame):
     if df.empty:
         st.info("No records match the current filters.")
         return
-    st.dataframe(style_map_table(df), use_container_width=use_container_width)
+    st.dataframe(style_map_table(df), use_container_width=True)
+
+
+# ---------------- Parser for your "Grade Report" exports ----------------
+def _safe_str(x) -> str:
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return ""
+    return str(x).strip()
+
+
+def _find_header_rows(df: pd.DataFrame) -> list[int]:
+    hits = []
+    for i in range(df.shape[0]):
+        if _safe_str(df.iat[i, 0]).lower() == "name (student id)":
+            hits.append(i)
+    return hits
+
+
+def _infer_subject(df: pd.DataFrame, header_row: int, fallback: str) -> str:
+    lookback = max(0, header_row - 80)
+    text_block = df.iloc[lookback:header_row, 0].dropna().astype(str).tolist()
+    joined = "\n".join(text_block).lower()
+    if "math:" in joined or "math k-12" in joined:
+        return "Math"
+    if "language usage" in joined:
+        return "Language Usage"
+    if "reading" in joined:
+        return "Reading"
+    return fallback
+
+
+def _extract_name_id(cell: str) -> Tuple[str, str]:
+    s = _safe_str(cell)
+    m = re.match(r"^(.*)\(([^()]*)\)\s*$", s)
+    if not m:
+        return (s, "")
+    return (m.group(1).strip(), m.group(2).strip())
+
+
+def _numeric_cols_in_window(row: pd.Series, start: int, end: int) -> list[int]:
+    cols = []
+    for c in range(start, end + 1):
+        v = row.iloc[c]
+        if isinstance(v, (int, float)) and not (isinstance(v, float) and np.isnan(v)):
+            cols.append(c)
+    return cols
+
+
+def _get_range_triplet(row: pd.Series, anchor: int) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    start = max(0, anchor - 2)
+    end = min(len(row) - 1, anchor + 10)
+    cols = _numeric_cols_in_window(row, start, end)
+    if len(cols) == 0:
+        return (None, None, None)
+    if len(cols) == 1:
+        v = row.iloc[cols[0]]
+        return (None, float(v), None)
+    low = float(row.iloc[cols[0]])
+    mid = float(row.iloc[cols[len(cols) // 2]])
+    high = float(row.iloc[cols[-1]])
+    return (low, mid, high)
+
+
+def _find_positions(row: pd.Series, labels: list[str]) -> dict[str, int]:
+    pos = {}
+    for i, v in enumerate(row):
+        s = _safe_str(v)
+        for lab in labels:
+            if s == lab:
+                pos[lab] = i
+    return pos
+
+
+def parse_grade_report_excel(excel_bytes: bytes, grade: int, term_label: str) -> pd.DataFrame:
+    xls = pd.ExcelFile(BytesIO(excel_bytes))
+    sheet = "Grade Report" if "Grade Report" in xls.sheet_names else xls.sheet_names[0]
+    df = pd.read_excel(BytesIO(excel_bytes), sheet_name=sheet, header=None)
+
+    header_rows = _find_header_rows(df)
+    if not header_rows:
+        return pd.DataFrame()
+
+    frames = []
+    fallback_order = ["Math", "Reading", "Language Usage"]
+
+    for block_idx, h in enumerate(header_rows):
+        fallback = fallback_order[block_idx] if block_idx < len(fallback_order) else f"Subject {block_idx+1}"
+        subject = _infer_subject(df, h, fallback=fallback)
+
+        header = df.iloc[h]
+        header2 = df.iloc[h + 1] if h + 1 < df.shape[0] else pd.Series([None] * df.shape[1])
+
+        positions = _find_positions(header, ["RIT Score", "Percentile", "Lexile", "Test", "A", "B", "C", "D"])
+
+        test_anchor = positions.get("Test", None)
+        date_col = test_anchor + 1 if test_anchor is not None and (test_anchor + 1) < df.shape[1] else None
+
+        duration_col = None
+        test_positions = [i for i, v in enumerate(header) if _safe_str(v) == "Test"]
+        for tp in test_positions:
+            if tp < len(header2) and _safe_str(header2.iloc[tp]).lower() == "duration":
+                duration_col = tp + 1 if (tp + 1) < df.shape[1] else None
+
+        rit_anchor = positions.get("RIT Score", None)
+        pct_anchor = positions.get("Percentile", None)
+
+        lex_anchor = positions.get("Lexile", None)
+        lex_col = lex_anchor + 1 if lex_anchor is not None and (lex_anchor + 1) < df.shape[1] else None
+
+        ia_cols = {lab: positions[lab] for lab in ["A", "B", "C", "D"] if lab in positions}
+
+        name_col = 2 if df.shape[1] > 2 else 0
+        start_row = h + 2
+
+        blank_streak = 0
+        for r in range(start_row, df.shape[0]):
+            name_raw = _safe_str(df.iat[r, name_col] if name_col < df.shape[1] else None)
+            if not name_raw:
+                blank_streak += 1
+                if blank_streak >= 5:
+                    break
+                continue
+            blank_streak = 0
+
+            student_name, student_id = _extract_name_id(name_raw)
+            row = df.iloc[r]
+
+            test_date = row.iloc[date_col] if date_col is not None else None
+
+            rit_low, rit_mid, rit_high = (None, None, None)
+            if rit_anchor is not None:
+                rit_low, rit_mid, rit_high = _get_range_triplet(row, rit_anchor)
+
+            p_low, p_mid, p_high = (None, None, None)
+            if pct_anchor is not None:
+                p_low, p_mid, p_high = _get_range_triplet(row, pct_anchor)
+
+            duration = _safe_str(row.iloc[duration_col]) if duration_col is not None else ""
+            lexile = _safe_str(row.iloc[lex_col]) if (subject.lower() == "reading" and lex_col is not None) else ""
+
+            ia_vals = {f"ia_{k.lower()}": _safe_str(row.iloc[c]) for k, c in ia_cols.items()}
+
+            frames.append(
+                {
+                    "term": term_label,
+                    "grade": grade,
+                    "subject": subject,
+                    "student_id": student_id,
+                    "student_name": student_name,
+                    # keep mid numeric internally for risk + growth + sorting
+                    "rit": rit_mid,
+                    "rit_low": rit_low,
+                    "rit_high": rit_high,
+                    "percentile": p_mid,
+                    "percentile_low": p_low,
+                    "percentile_high": p_high,
+                    "test_date": test_date,
+                    "lexile": lexile if lexile else None,
+                    "duration": duration if duration else None,
+                    **ia_vals,
+                }
+            )
+
+    out = pd.DataFrame(frames)
+    for c in ["rit", "rit_low", "rit_high", "percentile", "percentile_low", "percentile_high"]:
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce")
+    out = out[~(out["student_id"].fillna("") == "")]
+    return out.reset_index(drop=True)
+
+
+# ---------------- Drive file naming + term ordering ----------------
+FNAME_RE = re.compile(r"^MAP_(\d{4}-\d{2})_(Sep|Mar)_Grade(6|7|8)\.xlsx$", re.IGNORECASE)
+
+# Model A: "2025-26" => Sep 2025, Mar 2026
+def term_date_from_ay_season(academic_year: str, season: str) -> pd.Timestamp:
+    start_year = int(academic_year.split("-")[0])
+    if season.lower() == "sep":
+        return pd.Timestamp(year=start_year, month=9, day=1)
+    # Mar belongs to next calendar year
+    return pd.Timestamp(year=start_year + 1, month=3, day=1)
+
+
+def parse_drive_filename(name: str):
+    m = FNAME_RE.match(name)
+    if not m:
+        return None
+    academic_year = m.group(1)
+    season = m.group(2).title()
+    grade = int(m.group(3))
+    term_label = f"{season} {academic_year}"
+    term_date = term_date_from_ay_season(academic_year, season)
+    return academic_year, season, grade, term_label, term_date
+
+
+# ---------------- Sidebar: Drive + ingestion ----------------
+st.title("MAP Dashboard (Google Drive Storage)")
+st.caption("MAP files are stored in Google Drive and loaded automatically (no re-uploading each time).")
+
+folder_id = st.secrets.get("GDRIVE_FOLDER_ID")
+if not folder_id:
+    st.error("Missing secret: GDRIVE_FOLDER_ID")
+    st.stop()
+
+st.sidebar.header("Google Drive Storage")
+st.sidebar.caption("Folder ID is configured in Streamlit secrets.")
+
+with st.sidebar.expander("Upload Centre (saves files to Drive)", expanded=False):
+    academic_year = st.text_input("Academic Year (e.g., 2025-26)", value="2025-26")
+    season = st.selectbox("Season", ["Sep", "Mar"], index=0)
+    grade_tag = st.selectbox("Grade file", ["Grade6", "Grade7", "Grade8"], index=0)
+    up = st.file_uploader("Select Excel file", type=["xlsx"], key="drive_uploader")
+
+    if up is not None:
+        target_name = f"MAP_{academic_year}_{season}_{grade_tag}.xlsx"
+        st.write(f"Will save as: `{target_name}`")
+        if st.button("Save to Drive", type="primary"):
+            upload_bytes_to_folder(folder_id, target_name, up.getvalue(), overwrite=True)
+            st.success("Saved to Google Drive. Refreshing file list…")
+            st.cache_data.clear()
+
+# Load Drive file list
+@st.cache_data(show_spinner=False)
+def get_drive_map_files(folder_id: str):
+    files = list_files_in_folder(folder_id)
+    parsed = []
+    for f in files:
+        meta = parse_drive_filename(f["name"])
+        if meta is None:
+            continue
+        academic_year, season, grade, term_label, term_date = meta
+        parsed.append(
+            {
+                "id": f["id"],
+                "name": f["name"],
+                "modifiedTime": f.get("modifiedTime"),
+                "academic_year": academic_year,
+                "season": season,
+                "grade": grade,
+                "term_label": term_label,
+                "term_date": term_date,
+            }
+        )
+    return pd.DataFrame(parsed)
+
+drive_df = get_drive_map_files(folder_id)
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("Files found in Drive")
+if drive_df.empty:
+    st.sidebar.info("No MAP_*.xlsx files found yet. Use Upload Centre above.")
+else:
+    st.sidebar.write(f"{len(drive_df)} file(s) ready.")
+
+# ---------------- Controls ----------------
+st.sidebar.header("View")
+view_mode = st.sidebar.radio(
+    "Select View",
+    ["Teacher View", "Admin View", "Student Profile (Leader)", "Growth Trends"],
+    index=1,
+)
+
+st.sidebar.header("Intervention Priority Rules (Achievement)")
+pctl_risk = st.sidebar.slider("At Risk threshold (percentile mid)", 5, 50, 25, 1)
+pctl_high = st.sidebar.slider("High Risk threshold (percentile mid)", 1, 25, 10, 1)
+
+st.sidebar.markdown("---")
+st.sidebar.markdown(
+    f"""
+    <span class="map-pill map-blue">On Track</span><br>
+    <span class="map-pill map-yellow">At Risk (below {pctl_risk}th)</span><br>
+    <span class="map-pill map-red">High Risk (below {pctl_high}th)</span>
+    """,
+    unsafe_allow_html=True,
+)
+
+# ---------------- Build dataset from Drive ----------------
+@st.cache_data(show_spinner=False)
+def load_all_data_from_drive(drive_meta: pd.DataFrame) -> pd.DataFrame:
+    frames = []
+    for _, row in drive_meta.iterrows():
+        content = download_file_bytes(row["id"])
+        df_term = parse_grade_report_excel(content, grade=int(row["grade"]), term_label=row["term_label"])
+        if df_term.empty:
+            continue
+        df_term["academic_year"] = row["academic_year"]
+        df_term["season"] = row["season"]
+        df_term["term_date"] = row["term_date"]
+        frames.append(df_term)
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+data = load_all_data_from_drive(drive_df)
+
+if data.empty:
+    st.info("No usable MAP data loaded yet. Upload at least one MAP_*.xlsx file into Drive.")
+    st.stop()
+
+# Risk status based on MID percentile (as requested)
+data = apply_flags(data, pctl_risk=pctl_risk, pctl_high=pctl_high)
+data["percentile_status"] = data["percentile"].apply(lambda x: percentile_band(x, pctl_risk, pctl_high)[0])
+data = add_display_ranges(data)
+
+# Common filters
+grades = ["All"] + sorted(data["grade"].dropna().unique().tolist())
+subjects = ["All"] + sorted(data["subject"].dropna().unique().tolist())
+terms = ["All"] + [t for t in data.sort_values("term_date")["term"].dropna().unique().tolist()]
+academic_years = ["All"] + sorted(data["academic_year"].dropna().unique().tolist())
+
+# Student labels
+tmp_students = data[["student_id", "student_name"]].dropna().drop_duplicates()
+tmp_students["label"] = tmp_students["student_id"].astype(str) + " — " + tmp_students["student_name"].astype(str)
+student_labels = tmp_students.sort_values("label")["label"].tolist()
+
+
+def metric_row(df: pd.DataFrame):
+    total_rows = len(df)
+    priority_rows = int(df["intervention_priority"].sum()) if "intervention_priority" in df.columns else 0
+    pct_priority = (priority_rows / total_rows * 100) if total_rows else 0
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Records", f"{total_rows}")
+    c2.metric("Intervention Priority", f"{priority_rows}")
+    c3.metric("% Priority", f"{pct_priority:.1f}%")
 
 
 # ---------------- Teacher View ----------------
 if view_mode == "Teacher View":
     st.subheader("Teacher View")
 
-    if not teacher_vals:
-        st.warning("No teacher column detected in the data.")
-        st.stop()
+    c1, c2, c3, c4 = st.columns(4)
+    ay_sel = c1.selectbox("Academic Year", academic_years, index=0)
+    term_sel = c2.selectbox("Term", terms, index=0)
+    grade_sel = c3.selectbox("Grade", grades, index=0)
+    subject_sel = c4.selectbox("Subject", subjects, index=0)
 
-    teacher = st.selectbox("Select Teacher", teacher_vals)
-
-    c1, c2, c3 = st.columns(3)
-    term_sel = c1.selectbox("Term", terms, index=0)
-    grade_sel = c2.selectbox("Grade", grades, index=0)
-    subject_sel = c3.selectbox("Subject", subjects, index=0)
-
-    df = data[data["teacher"] == teacher].copy()
-
+    df = data.copy()
+    if ay_sel != "All":
+        df = df[df["academic_year"] == ay_sel]
     if term_sel != "All":
         df = df[df["term"] == term_sel]
     if grade_sel != "All":
@@ -190,22 +497,25 @@ if view_mode == "Teacher View":
     st.markdown("### Intervention Priority Students")
     priority_sort_key = {"High Risk": 0, "At Risk": 1, "On Track": 2}
     df["_priority_sort"] = df["priority_level"].map(priority_sort_key).fillna(9)
-
     priority_df = df[df["intervention_priority"]].sort_values(
-        ["_priority_sort", "subject", "percentile", "rit"],
-        ascending=[True, True, True, True]
+        ["_priority_sort", "grade", "subject", "percentile", "rit"],
+        ascending=[True, True, True, True, True]
     )
 
     show_cols = [
-        "student_id", "student_name", "grade", "section", "subject",
-        "rit", "percentile", "percentile_status", "priority_reason"
+        "academic_year", "term", "grade", "subject",
+        "student_id", "student_name",
+        "rit_range", "percentile_range",
+        "percentile_status", "priority_reason",
+        "lexile", "duration"
     ]
+    show_cols = [c for c in show_cols if c in priority_df.columns]
     show_styled_table(priority_df[show_cols])
 
     st.download_button(
         "Download intervention list (CSV)",
         data=priority_df[show_cols].to_csv(index=False).encode("utf-8"),
-        file_name=f"intervention_priority_{teacher.replace(' ', '_')}.csv",
+        file_name="intervention_priority_teacher_view.csv",
         mime="text/csv",
     )
 
@@ -213,204 +523,213 @@ if view_mode == "Teacher View":
     st.markdown("### All Students (filtered)")
     show_styled_table(df[show_cols])
 
-    df.drop(columns=["_priority_sort"], inplace=True, errors="ignore")
-
 
 # ---------------- Admin View ----------------
 elif view_mode == "Admin View":
     st.subheader("Admin View")
 
     c1, c2, c3, c4 = st.columns(4)
-    term_sel = c1.selectbox("Term", terms, index=0)
-    grade_sel = c2.selectbox("Grade", grades, index=0)
-    subject_sel = c3.selectbox("Subject", subjects, index=0)
-    teacher_sel = c4.selectbox("Teacher", teachers, index=0)
+    ay_sel = c1.selectbox("Academic Year", academic_years, index=0)
+    term_sel = c2.selectbox("Term", terms, index=0)
+    grade_sel = c3.selectbox("Grade", grades, index=0)
+    subject_sel = c4.selectbox("Subject", subjects, index=0)
 
     df = data.copy()
+    if ay_sel != "All":
+        df = df[df["academic_year"] == ay_sel]
     if term_sel != "All":
         df = df[df["term"] == term_sel]
     if grade_sel != "All":
         df = df[df["grade"] == grade_sel]
     if subject_sel != "All":
         df = df[df["subject"] == subject_sel]
-    if teacher_sel != "All":
-        df = df[df["teacher"] == teacher_sel]
 
     metric_row(df)
     map_badge_row(pctl_risk, pctl_high)
     st.divider()
 
-    st.markdown("### Intervention Priority (Schoolwide)")
+    st.markdown("### Intervention Priority (Schoolwide / Filtered)")
     priority_sort_key = {"High Risk": 0, "At Risk": 1, "On Track": 2}
     df["_priority_sort"] = df["priority_level"].map(priority_sort_key).fillna(9)
-
     priority_df = df[df["intervention_priority"]].sort_values(
         ["_priority_sort", "grade", "subject", "percentile", "rit"],
         ascending=[True, True, True, True, True],
     )
 
     show_cols_admin = [
-        "teacher", "student_id", "student_name", "grade", "section", "subject",
-        "rit", "percentile", "percentile_status", "priority_reason", "term"
+        "academic_year", "term", "grade", "subject",
+        "student_id", "student_name",
+        "rit_range", "percentile_range",
+        "percentile_status", "priority_reason",
+        "lexile", "duration"
     ]
+    show_cols_admin = [c for c in show_cols_admin if c in priority_df.columns]
     show_styled_table(priority_df[show_cols_admin])
 
     st.download_button(
         "Download intervention list (CSV)",
         data=priority_df[show_cols_admin].to_csv(index=False).encode("utf-8"),
-        file_name="intervention_priority_schoolwide.csv",
+        file_name="intervention_priority_admin_view.csv",
         mime="text/csv",
     )
 
     st.divider()
-    st.markdown("### Summary by Grade × Subject")
-
+    st.markdown("### Summary by Academic Year × Term × Grade × Subject (mid values used internally)")
     summary = (
-        df.groupby(["grade", "subject"], dropna=False)
-          .agg(
-              records=("student_id", "count"),
-              intervention_priority=("intervention_priority", "sum"),
-              avg_rit=("rit", "mean"),
-              avg_percentile=("percentile", "mean"),
-          )
-          .reset_index()
+        df.groupby(["academic_year", "term", "grade", "subject"], dropna=False)
+        .agg(
+            records=("student_id", "count"),
+            intervention_priority=("intervention_priority", "sum"),
+            avg_rit_mid=("rit", "mean"),
+            avg_percentile_mid=("percentile", "mean"),
+        )
+        .reset_index()
     )
-    summary["pct_intervention_priority"] = (
-        (summary["intervention_priority"] / summary["records"] * 100).round(1)
-    )
-    summary = summary.sort_values(["grade", "subject"])
+    summary["pct_intervention_priority"] = (summary["intervention_priority"] / summary["records"] * 100).round(1)
+    summary = summary.sort_values(["academic_year", "term", "grade", "subject"])
     st.dataframe(summary, use_container_width=True)
-
-    df.drop(columns=["_priority_sort"], inplace=True, errors="ignore")
 
 
 # ---------------- Student Profile (Leader) ----------------
-else:
+elif view_mode == "Student Profile (Leader)":
     st.subheader("Student Profile (Leader)")
 
-    if not student_vals:
-        st.warning("Student ID / Student Name columns not detected.")
+    if not student_labels:
+        st.warning("No students detected in the stored Drive files.")
         st.stop()
 
-    # Leader filters
-    f1, f2 = st.columns(2)
-    grade_sel = f1.selectbox("Grade (optional)", grades, index=0)
-    teacher_sel = f2.selectbox("Teacher (optional)", teachers, index=0)
+    f1, f2, f3 = st.columns(3)
+    ay_sel = f1.selectbox("Academic Year (optional)", academic_years, index=0)
+    grade_sel = f2.selectbox("Grade (optional)", grades, index=0)
+    student_label = f3.selectbox("Select Student", student_labels)
 
-    df0 = data.copy()
-    if grade_sel != "All":
-        df0 = df0[df0["grade"] == grade_sel]
-    if teacher_sel != "All":
-        df0 = df0[df0["teacher"] == teacher_sel]
-
-    tmp = df0[["student_id", "student_name"]].dropna().drop_duplicates()
-    tmp["label"] = tmp["student_id"].astype(str) + " — " + tmp["student_name"].astype(str)
-    student_list = tmp.sort_values("label")["label"].tolist()
-
-    student_label = st.selectbox("Select Student", student_list)
     student_id = student_label.split("—")[0].strip()
 
     s_df = data[data["student_id"].astype(str) == str(student_id)].copy()
+    if ay_sel != "All":
+        s_df = s_df[s_df["academic_year"] == ay_sel]
+    if grade_sel != "All":
+        s_df = s_df[s_df["grade"] == grade_sel]
+
     if s_df.empty:
-        st.info("No records found for this student.")
+        st.info("No records found for this selection.")
         st.stop()
 
-    # Student header
-    student_name = s_df["student_name"].iloc[0]
-    grade = s_df["grade"].iloc[0]
-    section = s_df["section"].iloc[0]
-    teacher = s_df["teacher"].iloc[0]
+    s_df = s_df.sort_values("term_date")
+    student_name = s_df["student_name"].dropna().iloc[0]
 
-    h1, h2, h3, h4 = st.columns(4)
+    latest = s_df.sort_values("term_date").iloc[-1]
+    overall_status = "Intervention Priority" if bool(latest["intervention_priority"]) else "On Track"
+
+    h1, h2, h3 = st.columns(3)
     h1.metric("Student", student_name)
-    h2.metric("Grade / Section", f"{int(grade)} / {section}")
-    h3.metric("Teacher", teacher)
-
-    latest_term = "Mar 2026" if "Mar 2026" in s_df["term"].unique() else "Sep 2025"
-    latest = s_df[s_df["term"] == latest_term]
-    overall_status = "Intervention Priority" if latest["intervention_priority"].any() else "On Track"
-    h4.metric("Current Status", f"{overall_status} ({latest_term})")
+    h2.metric("Latest Term", str(latest["term"]))
+    h3.metric("Current Status", overall_status)
 
     map_badge_row(pctl_risk, pctl_high)
     st.divider()
 
-    # Achievement Summary
-    st.markdown("### Achievement Summary")
+    st.markdown("### Achievement Summary (Full Ranges)")
+    core = s_df[["subject", "term", "term_date", "rit_range", "percentile_range", "percentile_status"]].copy()
 
-    core = s_df[["subject", "term", "rit", "percentile", "percentile_status"]].copy()
+    # Wide table by term (range display)
+    wide_rit = core.pivot_table(index="subject", columns="term", values="rit_range", aggfunc="first")
+    wide_pct = core.pivot_table(index="subject", columns="term", values="percentile_range", aggfunc="first")
 
-    wide = core.pivot_table(
-        index="subject",
-        columns="term",
-        values=["rit", "percentile"],
-        aggfunc="first"
-    )
+    out = pd.DataFrame(index=sorted(core["subject"].unique()))
+    for t in core.sort_values("term_date")["term"].unique():
+        if t in wide_rit.columns:
+            out[f"{t} RIT Range"] = wide_rit[t]
+        if t in wide_pct.columns:
+            out[f"{t} Percentile Range"] = wide_pct[t]
 
-    if isinstance(wide.columns, pd.MultiIndex):
-        wide.columns = [f"{c[1]} {c[0].upper()}" for c in wide.columns]
-
-    wide = wide.reset_index()
-
-    # Observed Growth (RIT)
-    if "Sep 2025 RIT" in wide.columns and "Mar 2026 RIT" in wide.columns:
-        wide["Observed Growth (RIT)"] = wide["Mar 2026 RIT"] - wide["Sep 2025 RIT"]
-
-    # Latest percentile status per subject
+    # Latest status per subject (from latest term date)
     latest_status = (
-        latest[["subject", "percentile_status"]]
-        .drop_duplicates()
-        .set_index("subject")
+        core.sort_values("term_date")
+        .groupby("subject")
+        .tail(1)
+        .set_index("subject")["percentile_status"]
     )
-    wide["Achievement Status"] = wide["subject"].map(latest_status["percentile_status"])
+    out["Achievement Status (Latest)"] = out.index.map(latest_status)
 
-    st.dataframe(wide.sort_values("subject"), use_container_width=True)
-
-    st.caption(
-        "Percentile indicates relative standing compared to national norms for the same grade and term. "
-        "Observed Growth reflects the change in RIT score across test events."
-    )
+    st.dataframe(out.reset_index().rename(columns={"index": "Subject"}), use_container_width=True)
 
     st.divider()
-
-    # Instructional Areas
-    st.markdown("### Instructional Areas")
-
-    subj_list = sorted(s_df["subject"].unique().tolist())
+    st.markdown("### Instructional Areas (Diagnostic Detail)")
+    subj_list = sorted(s_df["subject"].dropna().unique().tolist())
     selected_subject = st.selectbox("Select Subject", subj_list)
 
-    subj_df = s_df[s_df["subject"] == selected_subject].sort_values("term")
+    subj_df = s_df[s_df["subject"] == selected_subject].sort_values("term_date")
     ia_cols = [c for c in subj_df.columns if c.startswith("ia_")]
 
     if not ia_cols:
-        st.info("No instructional area data available for this subject in the export.")
+        st.info("No instructional area columns detected in this export for this subject.")
     else:
-        for term in subj_df["term"].unique():
-            row = subj_df[subj_df["term"] == term].iloc[0]
-
-            st.markdown(f"#### {selected_subject} — {term}")
+        for _, row in subj_df.iterrows():
+            st.markdown(f"#### {selected_subject} — {row['term']}")
             st.markdown(
-                f"**RIT:** {int(row['rit']) if pd.notna(row['rit']) else ''} &nbsp;&nbsp; "
-                f"**Percentile:** {int(row['percentile']) if pd.notna(row['percentile']) else ''} &nbsp;&nbsp; "
-                f"**Status:** {row['percentile_status']}"
+                f"**RIT Range:** {row.get('rit_range','')} &nbsp;&nbsp; "
+                f"**Percentile Range:** {row.get('percentile_range','')} &nbsp;&nbsp; "
+                f"**Status:** {row.get('percentile_status','')}"
             )
 
             ia_table = pd.DataFrame({
-                "Instructional Area": [
-                    c.replace("ia_", "").replace("_", " ").title()
-                    for c in ia_cols
-                ],
-                "RIT Score": [row[c] for c in ia_cols],
+                "Instructional Area": [c.replace("ia_", "").upper() for c in ia_cols],
+                "Band / Range": [str(row.get(c, "")).strip() for c in ia_cols],
             })
-
             st.dataframe(ia_table, use_container_width=True)
             st.divider()
 
-    # Raw records (audit-safe)
-    with st.expander("Show raw MAP records for this student"):
-        audit_cols = [
-            "term", "subject", "rit", "percentile",
-            "percentile_status", "priority_reason",
-            "grade", "section", "teacher"
-        ]
-        audit_cols = [c for c in audit_cols if c in s_df.columns]
-        show_styled_table(s_df[audit_cols].sort_values(["subject", "term"]))
+    with st.expander("Show raw records (audit-safe)"):
+        cols = ["academic_year", "term", "grade", "subject", "student_id", "student_name",
+                "rit_range", "percentile_range", "percentile_status", "priority_reason",
+                "lexile", "duration"]
+        cols += [c for c in s_df.columns if c.startswith("ia_")]
+        cols = [c for c in cols if c in s_df.columns]
+        show_styled_table(s_df[cols].sort_values(["subject", "term_date"]))
+
+
+# ---------------- Growth Trends ----------------
+else:
+    st.subheader("Growth Trends")
+
+    if not student_labels:
+        st.warning("No students detected in the stored Drive files.")
+        st.stop()
+
+    mode = st.radio("View mode", ["Term sequence (timeline)", "Academic year (Sep→Mar)"], horizontal=True)
+
+    c1, c2 = st.columns(2)
+    student_label = c1.selectbox("Student", student_labels)
+    subject_sel = c2.selectbox("Subject", sorted(data["subject"].dropna().unique().tolist()))
+
+    student_id = student_label.split("—")[0].strip()
+    s = data[(data["student_id"].astype(str) == str(student_id)) & (data["subject"] == subject_sel)].copy()
+    s = s.sort_values("term_date")
+
+    if s.empty:
+        st.info("No records found for this student/subject yet.")
+        st.stop()
+
+    st.markdown("### RIT (mid) over time")
+    # term sequence line chart using mid (internal numeric)
+    chart_df = s[["term_date", "rit"]].dropna().rename(columns={"term_date": "Term", "rit": "RIT (mid)"})
+    chart_df = chart_df.set_index("Term")
+    st.line_chart(chart_df)
+
+    st.markdown("### Observed Growth (RIT mid)")
+    s["Observed Growth (RIT mid)"] = s["rit"].diff()
+    growth_table = s[["academic_year", "term", "grade", "rit_range", "Observed Growth (RIT mid)", "percentile_status"]].copy()
+    show_styled_table(growth_table)
+
+    if mode.startswith("Academic year"):
+        st.divider()
+        st.markdown("### Academic year growth (Sep → Mar)")
+
+        # Pair Sep and Mar within each academic_year using mid for math, but display ranges
+        pivot = s.pivot_table(index="academic_year", columns="season", values="rit", aggfunc="first")
+        pivot = pivot.rename(columns={"Sep": "Sep RIT (mid)", "Mar": "Mar RIT (mid)"})
+        pivot["Year Growth (RIT mid)"] = pivot.get("Mar RIT (mid)") - pivot.get("Sep RIT (mid)")
+        st.dataframe(pivot.reset_index(), use_container_width=True)
+
+        st.caption("Year growth uses RIT mid internally; tables elsewhere show full ranges (low–high).")
