@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from gdrive_store import list_files_in_folder, download_file_bytes, upload_bytes_to_folder
+from gdrive_store import list_files_in_folder, download_file_bytes
 
 
 # ---------------- Page config ----------------
@@ -293,7 +293,7 @@ def parse_grade_report_excel(excel_bytes: bytes, grade: int, term_label: str) ->
                     "subject": subject,
                     "student_id": student_id,
                     "student_name": student_name,
-                    # keep mid numeric internally for risk + growth + sorting
+                    # mid numeric internally for risk + growth
                     "rit": rit_mid,
                     "rit_low": rit_low,
                     "rit_high": rit_high,
@@ -318,12 +318,12 @@ def parse_grade_report_excel(excel_bytes: bytes, grade: int, term_label: str) ->
 # ---------------- Drive file naming + term ordering ----------------
 FNAME_RE = re.compile(r"^MAP_(\d{4}-\d{2})_(Sep|Mar)_Grade(6|7|8)\.xlsx$", re.IGNORECASE)
 
-# Model A: "2025-26" => Sep 2025, Mar 2026
+
 def term_date_from_ay_season(academic_year: str, season: str) -> pd.Timestamp:
+    """Model A: '2025-26' => Sep 2025, Mar 2026"""
     start_year = int(academic_year.split("-")[0])
     if season.lower() == "sep":
         return pd.Timestamp(year=start_year, month=9, day=1)
-    # Mar belongs to next calendar year
     return pd.Timestamp(year=start_year + 1, month=3, day=1)
 
 
@@ -339,31 +339,26 @@ def parse_drive_filename(name: str):
     return academic_year, season, grade, term_label, term_date
 
 
-# ---------------- Sidebar: Drive + ingestion ----------------
-st.title("MAP Dashboard (Google Drive Storage)")
-st.caption("MAP files are stored in Google Drive and loaded automatically (no re-uploading each time).")
+# ---------------- Sidebar: Drive + ingestion (READ ONLY) ----------------
+st.title("MAP Dashboard")
+st.caption("Reads MAP Excel files from Google Drive (read-only). Upload files manually to the Drive folder.")
 
 folder_id = st.secrets.get("GDRIVE_FOLDER_ID")
 if not folder_id:
     st.error("Missing secret: GDRIVE_FOLDER_ID")
     st.stop()
 
-st.sidebar.header("Google Drive Storage")
-st.sidebar.caption("Folder ID is configured in Streamlit secrets.")
+st.sidebar.header("Data Source (Read-only)")
+st.sidebar.caption("Upload files manually to the Drive folder. The app will detect them automatically on refresh.")
 
-with st.sidebar.expander("Upload Centre (saves files to Drive)", expanded=False):
-    academic_year = st.text_input("Academic Year (e.g., 2025-26)", value="2025-26")
-    season = st.selectbox("Season", ["Sep", "Mar"], index=0)
-    grade_tag = st.selectbox("Grade file", ["Grade6", "Grade7", "Grade8"], index=0)
-    up = st.file_uploader("Select Excel file", type=["xlsx"], key="drive_uploader")
-
-    if up is not None:
-        target_name = f"MAP_{academic_year}_{season}_{grade_tag}.xlsx"
-        st.write(f"Will save as: `{target_name}`")
-        if st.button("Save to Drive", type="primary"):
-            upload_bytes_to_folder(folder_id, target_name, up.getvalue(), overwrite=True)
-            st.success("Saved to Google Drive. Refreshing file list…")
-            st.cache_data.clear()
+st.sidebar.info(
+    "✅ **Naming format** (required):\n\n"
+    "`MAP_2025-26_Sep_Grade6.xlsx`\n"
+    "`MAP_2025-26_Sep_Grade7.xlsx`\n"
+    "`MAP_2025-26_Sep_Grade8.xlsx`\n\n"
+    "Later:\n"
+    "`MAP_2025-26_Mar_Grade6.xlsx` etc."
+)
 
 # Load Drive file list
 @st.cache_data(show_spinner=False)
@@ -394,9 +389,16 @@ drive_df = get_drive_map_files(folder_id)
 st.sidebar.markdown("---")
 st.sidebar.subheader("Files found in Drive")
 if drive_df.empty:
-    st.sidebar.info("No MAP_*.xlsx files found yet. Use Upload Centre above.")
+    st.sidebar.warning("No correctly named MAP_*.xlsx files found yet.")
+    st.sidebar.caption("Check naming + that the files are in the configured folder.")
 else:
-    st.sidebar.write(f"{len(drive_df)} file(s) ready.")
+    st.sidebar.success(f"{len(drive_df)} file(s) detected.")
+    with st.sidebar.expander("Show detected files", expanded=False):
+        st.sidebar.dataframe(drive_df[["name", "modifiedTime"]], use_container_width=True)
+
+if st.sidebar.button("Refresh file list"):
+    st.cache_data.clear()
+    st.rerun()
 
 # ---------------- Controls ----------------
 st.sidebar.header("View")
@@ -440,7 +442,7 @@ def load_all_data_from_drive(drive_meta: pd.DataFrame) -> pd.DataFrame:
 data = load_all_data_from_drive(drive_df)
 
 if data.empty:
-    st.info("No usable MAP data loaded yet. Upload at least one MAP_*.xlsx file into Drive.")
+    st.info("No usable MAP data loaded yet. Ensure at least one correctly named file exists in Drive.")
     st.stop()
 
 # Risk status based on MID percentile (as requested)
@@ -603,7 +605,11 @@ elif view_mode == "Student Profile (Leader)":
     grade_sel = f2.selectbox("Grade (optional)", grades, index=0)
     student_label = f3.selectbox("Select Student", student_labels)
 
-    student_id = student_label.split("—")[0].strip()
+    # robust split
+    student_id = student_label.split("—", 1)[0].strip()
+    if not student_id:
+        st.info("Student ID not detected.")
+        st.stop()
 
     s_df = data[data["student_id"].astype(str) == str(student_id)].copy()
     if ay_sel != "All":
@@ -632,7 +638,6 @@ elif view_mode == "Student Profile (Leader)":
     st.markdown("### Achievement Summary (Full Ranges)")
     core = s_df[["subject", "term", "term_date", "rit_range", "percentile_range", "percentile_status"]].copy()
 
-    # Wide table by term (range display)
     wide_rit = core.pivot_table(index="subject", columns="term", values="rit_range", aggfunc="first")
     wide_pct = core.pivot_table(index="subject", columns="term", values="percentile_range", aggfunc="first")
 
@@ -643,7 +648,6 @@ elif view_mode == "Student Profile (Leader)":
         if t in wide_pct.columns:
             out[f"{t} Percentile Range"] = wide_pct[t]
 
-    # Latest status per subject (from latest term date)
     latest_status = (
         core.sort_values("term_date")
         .groupby("subject")
@@ -703,7 +707,7 @@ else:
     student_label = c1.selectbox("Student", student_labels)
     subject_sel = c2.selectbox("Subject", sorted(data["subject"].dropna().unique().tolist()))
 
-    student_id = student_label.split("—")[0].strip()
+    student_id = student_label.split("—", 1)[0].strip()
     s = data[(data["student_id"].astype(str) == str(student_id)) & (data["subject"] == subject_sel)].copy()
     s = s.sort_values("term_date")
 
@@ -712,7 +716,6 @@ else:
         st.stop()
 
     st.markdown("### RIT (mid) over time")
-    # term sequence line chart using mid (internal numeric)
     chart_df = s[["term_date", "rit"]].dropna().rename(columns={"term_date": "Term", "rit": "RIT (mid)"})
     chart_df = chart_df.set_index("Term")
     st.line_chart(chart_df)
@@ -725,11 +728,10 @@ else:
     if mode.startswith("Academic year"):
         st.divider()
         st.markdown("### Academic year growth (Sep → Mar)")
-
-        # Pair Sep and Mar within each academic_year using mid for math, but display ranges
         pivot = s.pivot_table(index="academic_year", columns="season", values="rit", aggfunc="first")
         pivot = pivot.rename(columns={"Sep": "Sep RIT (mid)", "Mar": "Mar RIT (mid)"})
         pivot["Year Growth (RIT mid)"] = pivot.get("Mar RIT (mid)") - pivot.get("Sep RIT (mid)")
         st.dataframe(pivot.reset_index(), use_container_width=True)
 
         st.caption("Year growth uses RIT mid internally; tables elsewhere show full ranges (low–high).")
+
