@@ -110,6 +110,38 @@ def apply_flags(df: pd.DataFrame, pctl_risk=25, pctl_high=10) -> pd.DataFrame:
     )
     return out
 
+def style_ia_table(df: pd.DataFrame, percentile_status: str):
+    """
+    Color-code Instructional Areas table based on the student's percentile_status.
+    Uses the same MAP palette as the rest of the app.
+    """
+    if df.empty:
+        return df.style
+
+    if percentile_status == "High Risk (Achievement)":
+        bg = "rgba(192,57,43,0.12)"
+        fg = "#C0392B"
+    elif percentile_status == "At Risk (Achievement)":
+        bg = "rgba(242,201,76,0.20)"
+        fg = "#8a6a00"
+    elif percentile_status == "On Track (Achievement)":
+        bg = "rgba(47,111,178,0.12)"
+        fg = "#2F6FB2"
+    else:
+        bg = "transparent"
+        fg = "inherit"
+
+    def _row(_):
+        return [f"background-color: {bg}"] * len(df.columns)
+
+    styler = df.style.apply(_row, axis=1)
+
+    if "Instructional Area" in df.columns:
+        styler = styler.map(lambda _: f"font-weight:700; color:{fg};", subset=["Instructional Area"])
+
+    return styler
+
+
 
 # ---------------- Styling: color-coded rows ----------------
 def _row_bg_color(row: pd.Series):
@@ -601,7 +633,7 @@ elif view_mode == "Student Profile (Leader)":
     ay_sel = f1.selectbox("Academic Year (optional)", academic_years, index=0, key="sp_ay")
     grade_sel = f2.selectbox("Grade (optional)", grades, index=0, key="sp_grade")
 
-    # ✅ Build the student dropdown AFTER filters so it refreshes properly
+    # Build the student dropdown AFTER filters so it refreshes properly
     student_pool = data.copy()
     if ay_sel != "All":
         student_pool = student_pool[student_pool["academic_year"] == ay_sel]
@@ -616,7 +648,7 @@ elif view_mode == "Student Profile (Leader)":
         st.warning("No students found for the selected filters.")
         st.stop()
 
-    # ✅ Reset selection if the previously selected value is no longer valid
+    # Reset selection if the previously selected value is no longer valid
     key_student = "sp_student"
     current = st.session_state.get(key_student)
     if current not in student_options:
@@ -693,7 +725,7 @@ elif view_mode == "Student Profile (Leader)":
     else:
         out["Achievement Status (Latest)"] = ""
 
-    st.dataframe(out.reset_index().rename(columns={"index": "Subject"}), use_container_width=True)
+    st.dataframe(out.reset_index().rename(columns={"index": "Subject"}), width="stretch")
 
     st.divider()
 
@@ -727,9 +759,9 @@ elif view_mode == "Student Profile (Leader)":
                 f"**Status:** {row.get('percentile_status','')}"
             )
 
-            # ✅ Build A/B/C/D table with names if present (ia_a_name, etc.)
+            # Build A/B/C/D table with names if present (ia_a_name, etc.)
             ia_rows = []
-            for c in sorted(ia_val_cols):  # keeps A,B,C,D order if columns are ia_a,ia_b,...
+            for c in sorted(ia_val_cols):
                 letter = c.replace("ia_", "").upper()  # A/B/C/D
                 name = row.get(f"{c}_name", "")
                 band = row.get(c, "")
@@ -742,8 +774,8 @@ elif view_mode == "Student Profile (Leader)":
 
             ia_table = pd.DataFrame(ia_rows)
 
-            # ✅ MAP colour-coded table (uses student's status colour)
-            st.dataframe(style_ia_table(ia_table, row.get("percentile_status", "")), use_container_width=True)
+            # MAP colour-coded table (uses student's status colour)
+            st.dataframe(style_ia_table(ia_table, row.get("percentile_status", "")), width="stretch")
             st.divider()
 
     # ---------- Raw Records ----------
@@ -753,11 +785,10 @@ elif view_mode == "Student Profile (Leader)":
             "rit_range", "percentile_range", "percentile_status", "priority_reason",
             "lexile", "duration",
         ]
-        # include both ia_* and ia_*_name for auditing
         cols += [c for c in s_df.columns if c.startswith("ia_")]
         cols = [c for c in cols if c in s_df.columns]
 
-        # ✅ sort BEFORE selecting cols (prevents KeyError on term_date)
+        # sort BEFORE selecting cols (prevents KeyError on term_date)
         if "term_date" in s_df.columns:
             sorted_s = s_df.sort_values(["subject", "term_date"], ascending=[True, True])
         else:
