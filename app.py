@@ -596,14 +596,34 @@ elif view_mode == "Admin View":
 elif view_mode == "Student Profile (Leader)":
     st.subheader("Student Profile (Leader)")
 
-    if not student_labels:
-        st.warning("No students detected in the stored Drive files.")
+    f1, f2, f3 = st.columns(3)
+
+    # Use stable keys so Streamlit can manage state correctly
+    ay_sel = f1.selectbox("Academic Year (optional)", academic_years, index=0, key="sp_ay")
+    grade_sel = f2.selectbox("Grade (optional)", grades, index=0, key="sp_grade")
+
+    # ✅ Build student list AFTER filters so it refreshes when AY/Grade changes
+    student_pool = data.copy()
+    if ay_sel != "All":
+        student_pool = student_pool[student_pool["academic_year"] == ay_sel]
+    if grade_sel != "All":
+        student_pool = student_pool[student_pool["grade"] == grade_sel]
+
+    tmp_students = student_pool[["student_id", "student_name"]].dropna().drop_duplicates()
+    tmp_students["label"] = tmp_students["student_id"].astype(str) + " — " + tmp_students["student_name"].astype(str)
+    student_options = tmp_students.sort_values("label")["label"].tolist()
+
+    if not student_options:
+        st.warning("No students found for the selected filters.")
         st.stop()
 
-    f1, f2, f3 = st.columns(3)
-    ay_sel = f1.selectbox("Academic Year (optional)", academic_years, index=0)
-    grade_sel = f2.selectbox("Grade (optional)", grades, index=0)
-    student_label = f3.selectbox("Select Student", student_labels)
+    # ✅ Reset selection if previous value is no longer in the filtered list
+    key_student = "sp_student"
+    current = st.session_state.get(key_student)
+    if current not in student_options:
+        st.session_state[key_student] = student_options[0]
+
+    student_label = f3.selectbox("Select Student", student_options, key=key_student)
 
     # robust split
     student_id = student_label.split("—", 1)[0].strip()
@@ -612,6 +632,8 @@ elif view_mode == "Student Profile (Leader)":
         st.stop()
 
     s_df = data[data["student_id"].astype(str) == str(student_id)].copy()
+
+    # Apply the same filters to the student records view
     if ay_sel != "All":
         s_df = s_df[s_df["academic_year"] == ay_sel]
     if grade_sel != "All":
@@ -621,28 +643,44 @@ elif view_mode == "Student Profile (Leader)":
         st.info("No records found for this selection.")
         st.stop()
 
-    s_df = s_df.sort_values("term_date")
+    # Sort safely
+    if "term_date" in s_df.columns:
+        s_df = s_df.sort_values("term_date")
+    else:
+        s_df = s_df.sort_values("term")
+
     student_name = s_df["student_name"].dropna().iloc[0]
 
-    latest = s_df.sort_values("term_date").iloc[-1]
-    overall_status = "Intervention Priority" if bool(latest["intervention_priority"]) else "On Track"
+    latest = s_df.iloc[-1]
+    overall_status = "Intervention Priority" if bool(latest.get("intervention_priority", False)) else "On Track"
 
     h1, h2, h3 = st.columns(3)
     h1.metric("Student", student_name)
-    h2.metric("Latest Term", str(latest["term"]))
+    h2.metric("Latest Term", str(latest.get("term", "")))
     h3.metric("Current Status", overall_status)
 
     map_badge_row(pctl_risk, pctl_high)
     st.divider()
 
     st.markdown("### Achievement Summary (Full Ranges)")
-    core = s_df[["subject", "term", "term_date", "rit_range", "percentile_range", "percentile_status"]].copy()
+
+    # Ensure required cols exist before selecting
+    needed = ["subject", "term", "rit_range", "percentile_range", "percentile_status"]
+    if "term_date" in s_df.columns:
+        needed.insert(2, "term_date")
+
+    core = s_df[[c for c in needed if c in s_df.columns]].copy()
+    if "term_date" not in core.columns:
+        # fallback for ordering if term_date missing
+        core["term_date"] = pd.NaT
 
     wide_rit = core.pivot_table(index="subject", columns="term", values="rit_range", aggfunc="first")
     wide_pct = core.pivot_table(index="subject", columns="term", values="percentile_range", aggfunc="first")
 
-    out = pd.DataFrame(index=sorted(core["subject"].unique()))
-    for t in core.sort_values("term_date")["term"].unique():
+    out = pd.DataFrame(index=sorted(core["subject"].dropna().unique()))
+    term_order = core.sort_values("term_date")["term"].dropna().unique().tolist()
+
+    for t in term_order:
         if t in wide_rit.columns:
             out[f"{t} RIT Range"] = wide_rit[t]
         if t in wide_pct.columns:
@@ -653,24 +691,37 @@ elif view_mode == "Student Profile (Leader)":
         .groupby("subject")
         .tail(1)
         .set_index("subject")["percentile_status"]
+        if "percentile_status" in core.columns
+        else pd.Series(dtype="object")
     )
-    out["Achievement Status (Latest)"] = out.index.map(latest_status)
+
+    out["Achievement Status (Latest)"] = out.index.map(latest_status) if len(latest_status) else ""
 
     st.dataframe(out.reset_index().rename(columns={"index": "Subject"}), use_container_width=True)
 
     st.divider()
     st.markdown("### Instructional Areas (Diagnostic Detail)")
-    subj_list = sorted(s_df["subject"].dropna().unique().tolist())
-    selected_subject = st.selectbox("Select Subject", subj_list)
 
-    subj_df = s_df[s_df["subject"] == selected_subject].sort_values("term_date")
+    subj_list = sorted(s_df["subject"].dropna().unique().tolist())
+    if not subj_list:
+        st.info("No subjects found for this student.")
+        st.stop()
+
+    selected_subject = st.selectbox("Select Subject", subj_list, key="sp_subject")
+
+    subj_df = s_df[s_df["subject"] == selected_subject].copy()
+    if "term_date" in subj_df.columns:
+        subj_df = subj_df.sort_values("term_date")
+    else:
+        subj_df = subj_df.sort_values("term")
+
     ia_cols = [c for c in subj_df.columns if c.startswith("ia_")]
 
     if not ia_cols:
         st.info("No instructional area columns detected in this export for this subject.")
     else:
         for _, row in subj_df.iterrows():
-            st.markdown(f"#### {selected_subject} — {row['term']}")
+            st.markdown(f"#### {selected_subject} — {row.get('term','')}")
             st.markdown(
                 f"**RIT Range:** {row.get('rit_range','')} &nbsp;&nbsp; "
                 f"**Percentile Range:** {row.get('percentile_range','')} &nbsp;&nbsp; "
@@ -685,12 +736,22 @@ elif view_mode == "Student Profile (Leader)":
             st.divider()
 
     with st.expander("Show raw records (audit-safe)"):
-        cols = ["academic_year", "term", "grade", "subject", "student_id", "student_name",
-                "rit_range", "percentile_range", "percentile_status", "priority_reason",
-                "lexile", "duration"]
+        cols = [
+            "academic_year", "term", "grade", "subject", "student_id", "student_name",
+            "rit_range", "percentile_range", "percentile_status", "priority_reason",
+            "lexile", "duration",
+        ]
         cols += [c for c in s_df.columns if c.startswith("ia_")]
         cols = [c for c in cols if c in s_df.columns]
-        show_styled_table(s_df[cols].sort_values(["subject", "term_date"]))
+
+        # ✅ sort BEFORE subsetting cols (prevents KeyError on term_date)
+        if "term_date" in s_df.columns:
+            sorted_s = s_df.sort_values(["subject", "term_date"], ascending=[True, True])
+        else:
+            sorted_s = s_df.sort_values(["subject", "term"], ascending=[True, True])
+
+        show_styled_table(sorted_s[cols])
+
 
 
 # ---------------- Growth Trends ----------------
