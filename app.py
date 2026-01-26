@@ -591,25 +591,24 @@ elif view_mode == "Admin View":
     summary = summary.sort_values(["academic_year", "term", "grade", "subject"])
     st.dataframe(summary, use_container_width=True)
 
-
 # ---------------- Student Profile (Leader) ----------------
 elif view_mode == "Student Profile (Leader)":
     st.subheader("Student Profile (Leader)")
 
     f1, f2, f3 = st.columns(3)
 
-    # Use stable keys so Streamlit can manage state correctly
+    # Stable keys so Streamlit state behaves correctly
     ay_sel = f1.selectbox("Academic Year (optional)", academic_years, index=0, key="sp_ay")
     grade_sel = f2.selectbox("Grade (optional)", grades, index=0, key="sp_grade")
 
-    # ✅ Build student list AFTER filters so it refreshes when AY/Grade changes
+    # ✅ Build the student dropdown AFTER filters so it refreshes properly
     student_pool = data.copy()
     if ay_sel != "All":
         student_pool = student_pool[student_pool["academic_year"] == ay_sel]
     if grade_sel != "All":
         student_pool = student_pool[student_pool["grade"] == grade_sel]
 
-    tmp_students = student_pool[["student_id", "student_name"]].dropna().drop_duplicates()
+    tmp_students = student_pool[["student_id", "student_name"]].dropna().drop_duplicates().copy()
     tmp_students["label"] = tmp_students["student_id"].astype(str) + " — " + tmp_students["student_name"].astype(str)
     student_options = tmp_students.sort_values("label")["label"].tolist()
 
@@ -617,7 +616,7 @@ elif view_mode == "Student Profile (Leader)":
         st.warning("No students found for the selected filters.")
         st.stop()
 
-    # ✅ Reset selection if previous value is no longer in the filtered list
+    # ✅ Reset selection if the previously selected value is no longer valid
     key_student = "sp_student"
     current = st.session_state.get(key_student)
     if current not in student_options:
@@ -625,15 +624,14 @@ elif view_mode == "Student Profile (Leader)":
 
     student_label = f3.selectbox("Select Student", student_options, key=key_student)
 
-    # robust split
+    # Robust split
     student_id = student_label.split("—", 1)[0].strip()
     if not student_id:
         st.info("Student ID not detected.")
         st.stop()
 
+    # Student records (then apply same filters)
     s_df = data[data["student_id"].astype(str) == str(student_id)].copy()
-
-    # Apply the same filters to the student records view
     if ay_sel != "All":
         s_df = s_df[s_df["academic_year"] == ay_sel]
     if grade_sel != "All":
@@ -643,14 +641,13 @@ elif view_mode == "Student Profile (Leader)":
         st.info("No records found for this selection.")
         st.stop()
 
-    # Sort safely
+    # Safe sort
     if "term_date" in s_df.columns:
         s_df = s_df.sort_values("term_date")
     else:
         s_df = s_df.sort_values("term")
 
     student_name = s_df["student_name"].dropna().iloc[0]
-
     latest = s_df.iloc[-1]
     overall_status = "Intervention Priority" if bool(latest.get("intervention_priority", False)) else "On Track"
 
@@ -662,16 +659,15 @@ elif view_mode == "Student Profile (Leader)":
     map_badge_row(pctl_risk, pctl_high)
     st.divider()
 
+    # ---------- Achievement Summary ----------
     st.markdown("### Achievement Summary (Full Ranges)")
 
-    # Ensure required cols exist before selecting
     needed = ["subject", "term", "rit_range", "percentile_range", "percentile_status"]
     if "term_date" in s_df.columns:
         needed.insert(2, "term_date")
 
     core = s_df[[c for c in needed if c in s_df.columns]].copy()
     if "term_date" not in core.columns:
-        # fallback for ordering if term_date missing
         core["term_date"] = pd.NaT
 
     wide_rit = core.pivot_table(index="subject", columns="term", values="rit_range", aggfunc="first")
@@ -686,20 +682,22 @@ elif view_mode == "Student Profile (Leader)":
         if t in wide_pct.columns:
             out[f"{t} Percentile Range"] = wide_pct[t]
 
-    latest_status = (
-        core.sort_values("term_date")
-        .groupby("subject")
-        .tail(1)
-        .set_index("subject")["percentile_status"]
-        if "percentile_status" in core.columns
-        else pd.Series(dtype="object")
-    )
-
-    out["Achievement Status (Latest)"] = out.index.map(latest_status) if len(latest_status) else ""
+    if "percentile_status" in core.columns:
+        latest_status = (
+            core.sort_values("term_date")
+            .groupby("subject")
+            .tail(1)
+            .set_index("subject")["percentile_status"]
+        )
+        out["Achievement Status (Latest)"] = out.index.map(latest_status)
+    else:
+        out["Achievement Status (Latest)"] = ""
 
     st.dataframe(out.reset_index().rename(columns={"index": "Subject"}), use_container_width=True)
 
     st.divider()
+
+    # ---------- Instructional Areas (Diagnostic Detail) ----------
     st.markdown("### Instructional Areas (Diagnostic Detail)")
 
     subj_list = sorted(s_df["subject"].dropna().unique().tolist())
@@ -715,9 +713,10 @@ elif view_mode == "Student Profile (Leader)":
     else:
         subj_df = subj_df.sort_values("term")
 
-    ia_cols = [c for c in subj_df.columns if c.startswith("ia_")]
+    # Only A/B/C/D value columns (exclude *_name helper columns)
+    ia_val_cols = [c for c in subj_df.columns if c.startswith("ia_") and not c.endswith("_name")]
 
-    if not ia_cols:
+    if not ia_val_cols:
         st.info("No instructional area columns detected in this export for this subject.")
     else:
         for _, row in subj_df.iterrows():
@@ -728,23 +727,37 @@ elif view_mode == "Student Profile (Leader)":
                 f"**Status:** {row.get('percentile_status','')}"
             )
 
-            ia_table = pd.DataFrame({
-                "Instructional Area": [c.replace("ia_", "").upper() for c in ia_cols],
-                "Band / Range": [str(row.get(c, "")).strip() for c in ia_cols],
-            })
-            st.dataframe(ia_table, use_container_width=True)
+            # ✅ Build A/B/C/D table with names if present (ia_a_name, etc.)
+            ia_rows = []
+            for c in sorted(ia_val_cols):  # keeps A,B,C,D order if columns are ia_a,ia_b,...
+                letter = c.replace("ia_", "").upper()  # A/B/C/D
+                name = row.get(f"{c}_name", "")
+                band = row.get(c, "")
+
+                name_str = "" if (name is None or str(name).strip().lower() == "nan") else str(name).strip()
+                band_str = "" if (band is None or str(band).strip().lower() == "nan") else str(band).strip()
+
+                label = f"{letter} — {name_str}" if name_str else f"{letter}"
+                ia_rows.append({"Instructional Area": label, "Band / Range": band_str})
+
+            ia_table = pd.DataFrame(ia_rows)
+
+            # ✅ MAP colour-coded table (uses student's status colour)
+            st.dataframe(style_ia_table(ia_table, row.get("percentile_status", "")), use_container_width=True)
             st.divider()
 
+    # ---------- Raw Records ----------
     with st.expander("Show raw records (audit-safe)"):
         cols = [
             "academic_year", "term", "grade", "subject", "student_id", "student_name",
             "rit_range", "percentile_range", "percentile_status", "priority_reason",
             "lexile", "duration",
         ]
+        # include both ia_* and ia_*_name for auditing
         cols += [c for c in s_df.columns if c.startswith("ia_")]
         cols = [c for c in cols if c in s_df.columns]
 
-        # ✅ sort BEFORE subsetting cols (prevents KeyError on term_date)
+        # ✅ sort BEFORE selecting cols (prevents KeyError on term_date)
         if "term_date" in s_df.columns:
             sorted_s = s_df.sort_values(["subject", "term_date"], ascending=[True, True])
         else:
